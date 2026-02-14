@@ -264,6 +264,19 @@ class PairsTab(QWidget):
         self.get_settings = get_settings
         self.selected_pair_id: str | None = None
         self._strategy_dialog: PairStrategyDialog | None = None
+        self._pair_counter = 0
+        self._pair_templates = [
+            "BTCUSDT",
+            "ETHUSDT",
+            "BNBUSDT",
+            "XRPUSDT",
+            "SOLUSDT",
+            "ADAUSDT",
+            "DOGEUSDT",
+            "LINKUSDT",
+            "AVAXUSDT",
+            "MATICUSDT",
+        ]
         self._build_ui()
         self._connect_signals()
 
@@ -323,6 +336,7 @@ class PairsTab(QWidget):
         self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
         self.price_updated.connect(self._on_price_updated)
         self.edit_strategy_button.setEnabled(False)
+        self.price_updated.connect(self._on_price_updated)
 
     def _selected_row(self) -> int:
         return self.table.currentRow()
