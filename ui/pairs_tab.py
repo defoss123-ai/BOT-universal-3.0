@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable
 from copy import deepcopy
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -18,6 +19,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QHeaderView,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -193,6 +195,50 @@ class PairStrategyDialog(QDialog):
         return updated
 
 
+class AddPairDialog(QDialog):
+    """Dialog to add a new pair manually."""
+
+    def __init__(self, default_mode: str, default_exchange: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add Pair")
+        self._build_ui(default_mode, default_exchange)
+
+    def _build_ui(self, default_mode: str, default_exchange: str) -> None:
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.symbol_input = QLineEdit()
+        self.symbol_input.setPlaceholderText("BTCUSDT")
+
+        self.mode_dropdown = QComboBox()
+        self.mode_dropdown.addItems(["Spot", "Futures"])
+        self.mode_dropdown.setCurrentText(default_mode)
+
+        self.exchange_dropdown = QComboBox()
+        self.exchange_dropdown.addItems(["Binance", "Bybit", "MEXC", "HTX"])
+        self.exchange_dropdown.setCurrentText(default_exchange)
+
+        form.addRow("Symbol", self.symbol_input)
+        form.addRow("Mode", self.mode_dropdown)
+        form.addRow("Exchange", self.exchange_dropdown)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def get_values(self) -> tuple[str, str, str]:
+        return (
+            self.symbol_input.text().strip().upper(),
+            self.mode_dropdown.currentText(),
+            self.exchange_dropdown.currentText(),
+        )
+
+
+
+
 class PairsTab(QWidget):
     """UI tab for managing trading pairs."""
 
@@ -216,6 +262,8 @@ class PairsTab(QWidget):
         self.bot_manager = bot_manager
         self.loop = loop
         self.get_settings = get_settings
+        self.selected_pair_id: str | None = None
+        self._strategy_dialog: PairStrategyDialog | None = None
         self._pair_counter = 0
         self._pair_templates = [
             "BTCUSDT",
@@ -242,8 +290,8 @@ class PairsTab(QWidget):
         self.add_pair_button = QPushButton("Add Pair")
         self.remove_pair_button = QPushButton("Remove Pair")
         self.edit_strategy_button = QPushButton("Edit Strategy")
-        self.start_button = QPushButton("Start")
-        self.stop_button = QPushButton("Stop")
+        self.start_button = QPushButton("Start Selected")
+        self.stop_button = QPushButton("Stop Selected")
         self.refresh_protection_button = QPushButton("Refresh Protection")
         self.cancel_protection_button = QPushButton("Cancel Protection")
         self.close_position_now_button = QPushButton("Close Position Now")
@@ -267,9 +315,13 @@ class PairsTab(QWidget):
             ["Pair", "Mode (Spot/Futures)", "Status", "Position", "DCA", "Avg Price", "Exchange"]
         )
         self.table.verticalHeader().setVisible(False)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 
         main_layout.addLayout(button_layout)
-        main_layout.addWidget(self.table)
+        main_layout.addWidget(self.table, 1)
 
     def _connect_signals(self) -> None:
         self.add_pair_button.clicked.connect(self.add_pair)
@@ -281,6 +333,9 @@ class PairsTab(QWidget):
         self.cancel_protection_button.clicked.connect(self.cancel_protection)
         self.close_position_now_button.clicked.connect(self.close_position_now)
         self.cancel_all_orders_button.clicked.connect(self.cancel_all_orders)
+        self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
+        self.price_updated.connect(self._on_price_updated)
+        self.edit_strategy_button.setEnabled(False)
         self.price_updated.connect(self._on_price_updated)
 
     def _selected_row(self) -> int:
@@ -295,13 +350,30 @@ class PairsTab(QWidget):
 
     def _selected_mode(self) -> str:
         row = self._selected_row()
-        item = self.table.item(row, 1)
+        item = self.table.item(row, self.COL_MODE)
         return item.text() if item else "Spot"
+
+
+    def _selected_status(self) -> str:
+        row = self._selected_row()
+        if row < 0:
+            return "STOPPED"
+        item = self.table.item(row, self.COL_STATUS)
+        return item.text().upper() if item else "STOPPED"
 
     def _selected_exchange(self) -> str:
         row = self._selected_row()
         item = self.table.item(row, self.COL_EXCHANGE)
         return item.text() if item else "Binance"
+
+
+    def _selected_pair_key(self) -> tuple[str, str, str] | None:
+        pair_name = self._selected_pair_name()
+        if not pair_name:
+            return None
+        exchange = self._selected_exchange()
+        mode = self._selected_mode()
+        return pair_name.upper(), exchange, mode
 
     def _find_pair_row(self, pair_name: str) -> int | None:
         for row in range(self.table.rowCount()):
@@ -309,6 +381,18 @@ class PairsTab(QWidget):
             if item and item.text().upper() == pair_name.upper():
                 return row
         return None
+
+    def _on_table_selection_changed(self) -> None:
+        pair_name = self._selected_pair_name()
+        self.edit_strategy_button.setEnabled(pair_name is not None)
+        if pair_name is None:
+            self.selected_pair_id = None
+            return
+
+        exchange = self._selected_exchange()
+        mode = self._selected_mode()
+        self.selected_pair_id = f"{pair_name.upper()}|{exchange}|{mode}"
+        log(f"Selected pair: {pair_name.upper()} ({exchange}, {mode})")
 
     def emit_price_update(self, pair_name: str, price: float) -> None:
         self.price_updated.emit(pair_name, price)
@@ -365,11 +449,22 @@ class PairsTab(QWidget):
         settings.enable_futures = mode.lower() == "futures"
         return settings
 
+
+    def _is_valid_symbol(self, symbol: str) -> bool:
+        symbol = symbol.strip().upper()
+        return bool(re.fullmatch(r"[A-Z0-9]{5,20}", symbol))
+
     def add_pair(self) -> None:
-        mode = "Futures" if self.get_settings().enable_futures else "Spot"
-        pair_name = self._pair_templates[self._pair_counter % len(self._pair_templates)]
-        exchange = self.exchange_selector.currentText()
-        self._pair_counter += 1
+        default_mode = "Futures" if self.get_settings().enable_futures else "Spot"
+        dialog = AddPairDialog(default_mode, self.exchange_selector.currentText(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        pair_name, mode, exchange = dialog.get_values()
+        if not self._is_valid_symbol(pair_name):
+            QMessageBox.warning(self, "Invalid symbol", "Symbol must be 5..20 chars (A-Z, 0-9).")
+            log("Invalid symbol for Add Pair")
+            return
 
         if self._find_pair_row(pair_name) is not None:
             log(f"UI: {pair_name} already added")
@@ -393,17 +488,21 @@ class PairsTab(QWidget):
         pair_name = self._selected_pair_name()
         row = self._selected_row()
         if not pair_name or row < 0:
+            log("Select a pair first")
             return
 
         settings = self.bot_manager.get_pair_strategy_settings(pair_name)
-        dialog = PairStrategyDialog(settings, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        self._strategy_dialog = PairStrategyDialog(settings, self)
+        log(f"Strategy opened for {pair_name.upper()}")
+        if self._strategy_dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        updated = dialog.get_settings()
+        updated = self._strategy_dialog.get_settings()
         self.bot_manager.update_pair_strategy_settings(pair_name, updated)
         self.table.setItem(row, self.COL_MODE, QTableWidgetItem(updated.mode))
+        self.table.setItem(row, self.COL_DCA, QTableWidgetItem(f"0/{int(updated.safety_orders_count)}"))
         self._refresh_row_state(pair_name)
+        log(f"Strategy saved for {pair_name.upper()}")
 
     def remove_pair(self) -> None:
         row = self._selected_row()
@@ -422,15 +521,21 @@ class PairsTab(QWidget):
         self.bot_manager.add_pair(pair_name, mode, exchange)
         await self.bot_manager.start_pair(pair_name)
         self._refresh_row_state(pair_name)
-        log(f"UI: start requested for {pair_name}")
+        log(f"Started: {pair_name.upper()} ({exchange}, {mode})")
 
     def start_pair(self) -> None:
-        pair_name = self._selected_pair_name()
-        mode = self._selected_mode()
-        exchange = self._selected_exchange()
+        pair_key = self._selected_pair_key()
         row = self._selected_row()
-        if not pair_name or row < 0:
+        if pair_key is None or row < 0:
+            log("Select a pair first")
             return
+
+        pair_name, exchange, mode = pair_key
+
+        if self._selected_status() == "RUNNING":
+            log("Pair already running")
+            return
+
         self.loop.create_task(self._run_start_pair(pair_name, mode, exchange))
 
 
@@ -502,15 +607,22 @@ class PairsTab(QWidget):
     def trigger_cancel_orders_for_pair(self) -> None:
         self.cancel_all_orders()
 
-    async def _run_stop_pair(self, pair_name: str) -> None:
+    async def _run_stop_pair(self, pair_name: str, mode: str, exchange: str) -> None:
         await self.bot_manager.stop_pair(pair_name)
         self._refresh_row_state(pair_name)
-        log(f"UI: stop requested for {pair_name}")
+        log(f"Stopped: {pair_name.upper()} ({exchange}, {mode})")
 
     def stop_pair(self) -> None:
-        pair_name = self._selected_pair_name()
+        pair_key = self._selected_pair_key()
         row = self._selected_row()
-        if not pair_name or row < 0:
+        if pair_key is None or row < 0:
+            log("Select a pair first")
             return
 
-        self.loop.create_task(self._run_stop_pair(pair_name))
+        pair_name, exchange, mode = pair_key
+
+        if self._selected_status() == "STOPPED":
+            log("Pair already stopped")
+            return
+
+        self.loop.create_task(self._run_stop_pair(pair_name, mode, exchange))
