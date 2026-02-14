@@ -1,0 +1,6 @@
+PyQt6
+pandas
+pandas-ta
+aiohttp
+websockets
+matplotlib
